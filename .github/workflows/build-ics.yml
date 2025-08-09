@@ -29,7 +29,8 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install beautifulsoup4 selenium
+          pip install beautifulsoup4 selenium pytz google-api-python-client google-auth-httplib2 google-auth-oauthlib
+
 
       - name: Generate ICS
         env:
