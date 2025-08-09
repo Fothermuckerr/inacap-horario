@@ -2,8 +2,7 @@ name: build-ics-daily
 
 on:
   schedule:
-    # Corre todos los días a las 09:05 AM Chile (aprox. 13:05 UTC en invierno)
-    - cron: "5 13 * * *"
+    - cron: "5 13 * * *"   # 09:05 AM Chile (invierno)
   workflow_dispatch:
 
 permissions:
@@ -12,7 +11,6 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -52,3 +50,4 @@ jobs:
           else
             echo "No changes in ICS."
           fi
+
