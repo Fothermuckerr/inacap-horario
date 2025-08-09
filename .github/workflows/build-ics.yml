@@ -39,7 +39,7 @@ jobs:
           SIGA_PASS: ${{ secrets.SIGA_PASS }}
         run: |
           mkdir -p public
-          python inacap_horario_to_ics.py --weeks 2 --headless --out public/inacap_horario.ics
+          python Inacap_to_Google_Calendar.py --weeks 2 --headless --out public/inacap_horario.ics
 
       - name: Commit updated ics
         run: |
