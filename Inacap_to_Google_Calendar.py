@@ -40,7 +40,7 @@ import time
 import argparse
 from html import unescape
 from datetime import datetime, date, time as dtime
-
+from getpass import getpass
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -387,12 +387,22 @@ def main():
     ap.add_argument("--calendar_id", type=str, default="primary", help="ID de calendario destino (p. ej. 'primary').")
     args = ap.parse_args()
 
-    # Usa variables de entorno para no exponer tu clave
-    user = "marco.zamorano04@inacapmail.cl"
-    pwd = "118831a0815!"
+    from getpass import getpass
+
+    # 1) Primero intenta leer de variables de entorno (ideal para GitHub Actions)
+    user = os.getenv("SIGA_USER")
+    pwd = os.getenv("SIGA_PASS")
+
+    # 2) Si estás local y no definiste variables, pídelo por consola para no hardcodear
+    if not user:
+        user = input("Usuario SIGA (correo): ").strip()
+    if not pwd:
+        pwd = getpass("Contraseña SIGA: ").strip()
+
     if not user or not pwd:
-        print("Faltan credenciales. Define SIGA_USER y SIGA_PASS en variables de entorno.")
+        print("Faltan credenciales. Define SIGA_USER y SIGA_PASS o introdúcelas por consola.")
         sys.exit(1)
+
 
     driver = build_driver(headless=args.headless)
 
@@ -436,8 +446,16 @@ def main():
         key = lambda ev: (ev[0].isoformat(), ev[1].strftime("%H:%M"), ev[2].strftime("%H:%M"), ev[3], ev[4])
         uniq = list({key(ev): ev for ev in acumulados}.values())
 
-        # 4) Exportar ICS
-        exportar_ics(uniq, salida=args.out)
+        # 4) Exportar ICS (si estamos en Actions, publicar en /public)
+        out_path = args.out
+        if os.getenv("GITHUB_ACTIONS", "").lower() == "true":
+            os.makedirs("public", exist_ok=True)
+            # si no pasaste --out, forzamos a public/
+            if out_path == "inacap_horario.ics":
+                out_path = "public/inacap_horario.ics"
+
+        exportar_ics(uniq, salida=out_path)
+
 
         # 5) (Opcional) Empujar a Google Calendar
         if args.push:
