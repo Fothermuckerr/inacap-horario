@@ -1,0 +1,32 @@
+name: Inacap Calendar
+
+on:
+  schedule:
+    - cron: "0 8 * * *" # todos los días a las 08:00 UTC
+  workflow_dispatch: # para ejecutarlo manualmente
+
+jobs:
+  run-script:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Clonar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias
+        run: |
+          pip install -r requirements.txt
+
+      - name: Ejecutar script
+        env:
+          SIGA_USER: ${{ secrets.SIGA_USER }}
+          SIGA_PASS: ${{ secrets.SIGA_PASS }}
+          TOKEN_PICKLE_B64: ${{ secrets.TOKEN_PICKLE_B64 }}
+        run: |
+          echo "$TOKEN_PICKLE_B64" | base64 --decode > token.pickle
+          python Inacap_to_Google_Calendar.py --weeks 2 --push --calendar_id primary --headless
