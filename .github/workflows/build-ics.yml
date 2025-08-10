@@ -2,7 +2,7 @@ name: build-ics-daily
 
 on:
   schedule:
-    - cron: "5 13 * * *"   # 09:05 AM Chile (invierno)
+    - cron: "0 12 * * *"   # 08:00 AM Chile (invierno, UTC-4)
   workflow_dispatch:
 
 permissions:
