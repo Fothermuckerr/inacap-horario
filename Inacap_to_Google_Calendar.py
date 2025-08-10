@@ -1,6 +1,3 @@
-
-
-
 # -*- coding: utf-8 -*-
 """
 inacap_horario_to_ics.py
@@ -39,7 +36,7 @@ import sys
 import time
 import argparse
 from html import unescape
-from datetime import datetime, date, time as dtime
+from datetime import datetime, date, time as dtime, timezone
 from getpass import getpass
 from bs4 import BeautifulSoup
 from selenium import webdriver
@@ -202,14 +199,14 @@ def extraer_eventos_fallback_movil(html: str):
             eventos.append((f, t_ini, t_fin, resumen, contenido))
     return eventos
 
-# ====== GENERACIÓN ICS (con VTIMEZONE ======
+# ====== GENERACIÓN ICS (con VTIMEZONE) ======
 def construir_evento(uid_counter, resumen, fecha, t_ini, t_fin, descripcion=""):
     """
     Crea un VEVENT usando TZID=America/Santiago (horas tal como aparecen en SIGA).
     """
     resumen = (resumen or "").replace("\n", " ").strip()
     desc = (descripcion or "").replace("\n", "\\n")
-    dtstamp = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+    dtstamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     dtstart = f"TZID={TZID}:{fecha.strftime('%Y%m%d')}T{t_ini.strftime('%H%M%S')}"
     dtend   = f"TZID={TZID}:{fecha.strftime('%Y%m%d')}T{t_fin.strftime('%H%M%S')}"
     uid = f"inacap-{fecha.strftime('%Y%m%d')}-{t_ini.strftime('%H%M')}-{uid_counter}@siga"
@@ -250,7 +247,6 @@ def exportar_ics(eventos, salida="inacap_horario.ics", nombre="Horario INACAP"):
         "END:VTIMEZONE\r\n"
     )
     bloques = [construir_evento(i + 1, ev[3], ev[0], ev[1], ev[2], ev[4]) for i, ev in enumerate(eventos)]
-# ✅ sin f-string dentro del join
     contenido = (
         "BEGIN:VCALENDAR\r\n"
         "PRODID:-//INACAP->GoogleCalendar//ES\r\n"
@@ -269,7 +265,6 @@ def exportar_ics(eventos, salida="inacap_horario.ics", nombre="Horario INACAP"):
     print(f"Listo: generado {salida} con {len(eventos)} eventos.")
 
 # ====== GOOGLE CALENDAR API (push directo) ======
-import hashlib
 import pickle
 import pytz
 from googleapiclient.discovery import build
@@ -296,40 +291,31 @@ def get_calendar_service():
             pickle.dump(creds, token)
     return build("calendar", "v3", credentials=creds)
 
-def _event_id_from_uid(uid: str) -> str:
-    # Google exige [a-z0-9_-] y tamaño limitado: usamos hash estable
-    h = hashlib.sha1(uid.encode("utf-8")).hexdigest()
-    return f"inacap-{h}"
-
 def push_to_google_calendar(calendar_id: str, eventos):
     """
-    Inserta/actualiza eventos en Google Calendar.
-    eventos: lista de tu script -> (fecha, t_ini, t_fin, resumen, descripcion)
+    Inserta eventos en Google Calendar usando 'events.import_' con iCalUID
+    para evitar duplicados. 'eventos' = lista: (fecha, t_ini, t_fin, resumen, descripcion)
     """
     service = get_calendar_service()
-    tz = TZID
-    tzinfo = pytz.timezone(tz)
+    tzinfo = pytz.timezone(TZID)
 
     for i, (f, t_ini, t_fin, resumen, descripcion) in enumerate(eventos, start=1):
         start_dt = tzinfo.localize(datetime.combine(f, t_ini))
         end_dt   = tzinfo.localize(datetime.combine(f, t_fin))
 
-        uid = f"inacap-{f.strftime('%Y%m%d')}-{t_ini.strftime('%H%M')}-{i}@siga"
-        event_id = _event_id_from_uid(uid)
+        ical_uid = f"inacap-{f.strftime('%Y%m%d')}-{t_ini.strftime('%H%M')}-{i}@siga"
 
         body = {
-            "id": event_id,   # upsert estable: update si existe, insert si no
+            # NO uses 'id' aquí
+            "iCalUID": ical_uid,
             "summary": resumen,
             "description": descripcion,
-            "start": {"dateTime": start_dt.isoformat(), "timeZone": tz},
-            "end":   {"dateTime": end_dt.isoformat(),   "timeZone": tz},
+            "start": {"dateTime": start_dt.isoformat(), "timeZone": TZID},
+            "end":   {"dateTime": end_dt.isoformat(),   "timeZone": TZID},
         }
-        try:
-            service.events().update(calendarId=calendar_id, eventId=event_id, body=body).execute()
-            print(f"Actualizado: {resumen} ({start_dt})")
-        except Exception:
-            service.events().insert(calendarId=calendar_id, body=body).execute()
-            print(f"Creado: {resumen} ({start_dt})")
+
+        service.events().import_(calendarId=calendar_id, body=body).execute()
+        print(f"Importado: {resumen} ({start_dt})")
 
 # ====== FLUJO SELENIUM ======
 def login_adfs_y_ir_a_resumen(driver, user, pwd):
@@ -403,7 +389,6 @@ def main():
         print("Faltan credenciales. Define SIGA_USER y SIGA_PASS o introdúcelas por consola.")
         sys.exit(1)
 
-
     driver = build_driver(headless=args.headless)
 
     try:
@@ -455,7 +440,6 @@ def main():
                 out_path = "public/inacap_horario.ics"
 
         exportar_ics(uniq, salida=out_path)
-
 
         # 5) (Opcional) Empujar a Google Calendar
         if args.push:
