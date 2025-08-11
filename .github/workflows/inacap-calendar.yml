@@ -2,7 +2,7 @@ name: Inacap Calendar
 
 on:
   schedule:
-    - cron: "0 8 * * *" # todos los días a las 08:00 UTC
+    - cron: "0 12 * * *" # todos los días a las 08:00 UTC
   workflow_dispatch: # para ejecutarlo manualmente
 
 jobs:
