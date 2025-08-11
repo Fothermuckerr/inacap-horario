@@ -69,7 +69,6 @@ TZID = "America/Santiago"
 MESES = {"ene":1, "feb":2, "mar":3, "abr":4, "may":5, "jun":6,
          "jul":7, "ago":8, "sep":9, "oct":10, "nov":11, "dic":12}
 
-
 # ====== UTILIDADES ======
 def build_driver(headless=True):
     opts = Options()
@@ -198,6 +197,96 @@ def extraer_eventos_fallback_movil(html: str):
             resumen = contenido.split(" / ")[0]
             eventos.append((f, t_ini, t_fin, resumen, contenido))
     return eventos
+
+# ====== FUSIÓN DE BLOQUES CONTIGUOS ======
+def fusionar_eventos_por_asignatura_en_el_dia(eventos):
+    """
+    Agrupa TODOS los bloques de la misma asignatura por día en un único evento
+    que va desde la hora más temprana hasta la más tardía, SIN importar huecos.
+
+    eventos: lista de tuplas (fecha, t_ini, t_fin, resumen, descripcion)
+    """
+    if not eventos:
+        return []
+
+    grupos = {}  # key: (fecha, resumen) -> datos agregados
+    for f, t_ini, t_fin, resumen, desc in eventos:
+        key = (f, resumen)
+        if key not in grupos:
+            grupos[key] = {
+                "fecha": f,
+                "resumen": resumen,
+                "ini": t_ini,
+                "fin": t_fin,
+                "segmentos": [(t_ini, t_fin, desc)],
+            }
+        else:
+            g = grupos[key]
+            if t_ini < g["ini"]:
+                g["ini"] = t_ini
+            if t_fin > g["fin"]:
+                g["fin"] = t_fin
+            g["segmentos"].append((t_ini, t_fin, desc))
+
+    fusionados = []
+    for g in grupos.values():
+        # Ordenar segmentos por hora de inicio y componer una descripción útil
+        segs = sorted(g["segmentos"], key=lambda s: s[0])
+        lineas = []
+        vistos = set()
+        for s_ini, s_fin, s_desc in segs:
+            linea = f"{s_ini.strftime('%H:%M')}-{s_fin.strftime('%H:%M')} · {s_desc}"
+            if linea not in vistos:
+                lineas.append(linea)
+                vistos.add(linea)
+        nueva_desc = "Bloques agrupados del día:\n" + "\n".join(lineas)
+
+        fusionados.append((g["fecha"], g["ini"], g["fin"], g["resumen"], nueva_desc))
+
+    # Orden estable para exportar/push
+    fusionados.sort(key=lambda e: (e[0], e[1], e[3]))
+    return fusionados
+    """
+    Fusiona bloques contiguos o superpuestos de la MISMA asignatura ('resumen')
+    en el MISMO día. 'eventos' es una lista de tuplas:
+       (fecha, t_ini, t_fin, resumen, descripcion)
+    Devuelve una nueva lista con los intervalos fusionados.
+    """
+    if not eventos:
+        return []
+
+    # Orden estable: fecha, asignatura, hora de inicio
+    eventos_ordenados = sorted(eventos, key=lambda e: (e[0], e[3], e[1]))
+
+    fusionados = []
+    for ev in eventos_ordenados:
+        f, t_ini, t_fin, resumen, desc = ev
+
+        if not fusionados:
+            fusionados.append(ev)
+            continue
+
+        lf, lt_ini, lt_fin, lres, ldesc = fusionados[-1]
+
+        misma_fecha_y_asignatura = (f == lf and resumen == lres)
+        # contiguos o superpuestos: ej. 10:00-10:45 y 10:45-12:15
+        contiguos_o_overlap = (t_ini <= lt_fin)
+
+        if misma_fecha_y_asignatura and contiguos_o_overlap:
+            nuevo_ini = lt_ini if lt_ini <= t_ini else t_ini
+            nuevo_fin = lt_fin if lt_fin >= t_fin else t_fin
+
+            # Unir descripciones si aportan información distinta
+            if desc != ldesc and desc not in ldesc:
+                nueva_desc = (ldesc + "\\n" + desc).strip()
+            else:
+                nueva_desc = ldesc
+
+            fusionados[-1] = (lf, nuevo_ini, nuevo_fin, lres, nueva_desc)
+        else:
+            fusionados.append(ev)
+
+    return fusionados
 
 # ====== GENERACIÓN ICS (con VTIMEZONE) ======
 def construir_evento(uid_counter, resumen, fecha, t_ini, t_fin, descripcion=""):
@@ -373,8 +462,6 @@ def main():
     ap.add_argument("--calendar_id", type=str, default="primary", help="ID de calendario destino (p. ej. 'primary').")
     args = ap.parse_args()
 
-    from getpass import getpass
-
     # 1) Primero intenta leer de variables de entorno (ideal para GitHub Actions)
     user = os.getenv("SIGA_USER")
     pwd = os.getenv("SIGA_PASS")
@@ -431,19 +518,22 @@ def main():
         key = lambda ev: (ev[0].isoformat(), ev[1].strftime("%H:%M"), ev[2].strftime("%H:%M"), ev[3], ev[4])
         uniq = list({key(ev): ev for ev in acumulados}.values())
 
+        # 3.5) Fusionar bloques contiguos por asignatura (mismo día)
+        fusionados = fusionar_eventos_por_asignatura_en_el_dia(uniq)
+
+
         # 4) Exportar ICS (si estamos en Actions, publicar en /public)
         out_path = args.out
         if os.getenv("GITHUB_ACTIONS", "").lower() == "true":
             os.makedirs("public", exist_ok=True)
-            # si no pasaste --out, forzamos a public/
             if out_path == "inacap_horario.ics":
                 out_path = "public/inacap_horario.ics"
 
-        exportar_ics(uniq, salida=out_path)
+        exportar_ics(fusionados, salida=out_path)
 
         # 5) (Opcional) Empujar a Google Calendar
         if args.push:
-            push_to_google_calendar(calendar_id=args.calendar_id, eventos=uniq)
+            push_to_google_calendar(calendar_id=args.calendar_id, eventos=fusionados)
             print(f"Sincronización con Google Calendar completada en '{args.calendar_id}'.")
 
     except Exception as e:
