@@ -8,6 +8,7 @@ inacap_horario_to_ics.py
 - Parser desktop y fallback móvil
 - Exporta un archivo .ics (iCalendar) con TZ America/Santiago (incluye VTIMEZONE)
 - (Opcional) Empuja/actualiza eventos directamente en Google Calendar vía API (upsert idempotente)
+- Une bloques contiguos (misma asignatura/descripcion en el mismo día)
 
 Requisitos:
   pip install selenium beautifulsoup4 google-api-python-client google-auth-httplib2 google-auth-oauthlib pytz
@@ -197,6 +198,63 @@ def extraer_eventos_fallback_movil(html: str):
             resumen = contenido.split(" / ")[0]
             eventos.append((f, t_ini, t_fin, resumen, contenido))
     return eventos
+
+# ====== UNIR BLOQUES CONTIGUOS ======
+from datetime import timedelta
+
+def _norm(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def merge_contiguous_events(eventos):
+    """
+    Une eventos contiguos/solapados del MISMO día con IGUAL resumen y descripcion.
+    Entrada y salida: lista de tuplas (fecha, t_ini, t_fin, resumen, descripcion).
+    Reglas:
+      - compara (resumen, descripcion) normalizados
+      - si mismo día y (t_fin_prev == t_ini_curr) o solapan -> extiende t_fin
+    """
+    if not eventos:
+        return []
+
+    # Orden estable por llave de agrupación y hora de inicio
+    def sort_key(ev):
+        f, ti, tf, res, des = ev
+        return (f, _norm(res), _norm(des), ti, tf)
+
+    eventos_ord = sorted(eventos, key=sort_key)
+    merged = []
+
+    def as_dt(fecha, t):  # helper para comparar tiempos y hacer max
+        return datetime.combine(fecha, t)
+
+    cur_f, cur_ti, cur_tf, cur_res, cur_des = eventos_ord[0]
+    for ev in eventos_ord[1:]:
+        f, ti, tf, res, des = ev
+        same_day = (f == cur_f)
+        same_key = (_norm(res) == _norm(cur_res) and _norm(des) == _norm(cur_des))
+
+        if same_day and same_key:
+            # ¿Contiguos o solapados?
+            if as_dt(f, ti) <= as_dt(cur_f, cur_tf):
+                # solapa o toca borde -> extendemos fin
+                if as_dt(f, tf) > as_dt(cur_f, cur_tf):
+                    cur_tf = tf
+                # else: está completamente dentro, ignoramos
+                continue
+            # check contiguo exacto: fin == inicio siguiente
+            if as_dt(cur_f, cur_tf) + timedelta(seconds=0) == as_dt(f, ti):
+                cur_tf = tf
+                continue
+
+        # si no se unió, cerramos el acumulado
+        merged.append((cur_f, cur_ti, cur_tf, cur_res, cur_des))
+        cur_f, cur_ti, cur_tf, cur_res, cur_des = f, ti, tf, res, des
+
+    # push último
+    merged.append((cur_f, cur_ti, cur_tf, cur_res, cur_des))
+    return merged
 
 # ====== UID ESTABLE ======
 import hashlib
@@ -472,22 +530,25 @@ def main():
             if i < args.weeks - 1:
                 mover_semana(driver, "next")
 
-        # 3) Deduplicar
+        # 3) Deduplicar por (fecha, ini, fin, resumen, descripcion)
         key = lambda ev: (ev[0].isoformat(), ev[1].strftime("%H:%M"), ev[2].strftime("%H:%M"), ev[3], ev[4])
         uniq = list({key(ev): ev for ev in acumulados}.values())
 
-        # 4) Exportar ICS
+        # 4) Unir bloques contiguos/solapados de misma clase en el mismo día
+        merged = merge_contiguous_events(uniq)
+
+        # 5) Exportar ICS
         out_path = args.out
         if os.getenv("GITHUB_ACTIONS", "").lower() == "true":
             os.makedirs("public", exist_ok=True)
             if out_path == "inacap_horario.ics":
                 out_path = "public/inacap_horario.ics"
 
-        exportar_ics(uniq, salida=out_path)
+        exportar_ics(merged, salida=out_path)
 
-        # 5) (Opcional) Empujar a Google Calendar (upsert)
+        # 6) (Opcional) Empujar a Google Calendar (upsert)
         if args.push:
-            push_to_google_calendar(calendar_id=args.calendar_id, eventos=uniq)
+            push_to_google_calendar(calendar_id=args.calendar_id, eventos=merged)
             print(f"Sincronización con Google Calendar completada en '{args.calendar_id}'.")
 
     except Exception as e:
