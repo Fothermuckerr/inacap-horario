@@ -8,27 +8,10 @@ inacap_horario_to_ics.py
 - Parser desktop y fallback móvil
 - Exporta un archivo .ics (iCalendar) con TZ America/Santiago (incluye VTIMEZONE)
 - (Opcional) Empuja/actualiza eventos directamente en Google Calendar vía API (upsert idempotente)
-- Une bloques contiguos (misma asignatura/descripcion en el mismo día)
+- Une bloques contiguos (misma asignatura/descripcion en el mismo día) permitiendo un gap configurable
 
 Requisitos:
   pip install selenium beautifulsoup4 google-api-python-client google-auth-httplib2 google-auth-oauthlib pytz
-
-Credenciales SIGA (recomendado, variables de entorno):
-  # Windows PowerShell
-  $env:SIGA_USER="tu_correo@inacapmail.cl"; $env:SIGA_PASS="tu_clave"
-  # Linux/Mac (bash)
-  export SIGA_USER="tu_correo@inacapmail.cl"; export SIGA_PASS="tu_clave"
-
-Credenciales Google:
-  - Coloca 'credentials.json' (OAuth de tipo Escritorio) en el mismo directorio.
-  - La primera vez pedirá consentimiento y guardará 'token.pickle'.
-
-Ejemplos:
-  # Genera .ics (2 semanas) sin API
-  python inacap_horario_to_ics.py --weeks 2 --out inacap_horario.ics --headless
-
-  # Genera .ics y empuja a tu calendario principal
-  python inacap_horario_to_ics.py --weeks 2 --push --calendar_id primary --headless
 """
 
 import os
@@ -37,7 +20,7 @@ import sys
 import time
 import argparse
 from html import unescape
-from datetime import datetime, date, time as dtime, timezone
+from datetime import datetime, date, time as dtime, timezone, timedelta
 from getpass import getpass
 from bs4 import BeautifulSoup
 from selenium import webdriver
@@ -118,14 +101,12 @@ def extraer_eventos_desde_html(html: str):
     if not tabla:
         return []  # deja que el caller intente fallback móvil
 
-    # Encabezados: tomar TODAS las celdas del header excepto la primera (la de horas)
     header_row = tabla.select_one("thead tr")
     if not header_row:
         return []
     header_cells = header_row.find_all(["th", "td"])
-    headers_dias = [limpiar_texto(c.get_text()) for c in header_cells[1:]]  # skip la 1ª
+    headers_dias = [limpiar_texto(c.get_text()) for c in header_cells[1:]]
 
-    # Mapear a fechas (último número del texto del header)
     fechas = []
     for h in headers_dias:
         m = re.search(r"(\d{1,2})$", h) or re.search(r"\b(\d{1,2})\b", h)
@@ -143,13 +124,11 @@ def extraer_eventos_desde_html(html: str):
         t_ini = hhmm_to_time(m.group(1))
         t_fin = hhmm_to_time(m.group(2))
 
-        # celdas por día
         for idx, td in enumerate(cells[1:]):
             contenido = limpiar_texto(td.get_text(" "))
             if not contenido or contenido.lower().startswith("sin clases"):
                 continue
 
-            # Fecha de este día
             f = None
             if idx < len(fechas) and fechas[idx] is not None:
                 f = fechas[idx]
@@ -199,26 +178,23 @@ def extraer_eventos_fallback_movil(html: str):
             eventos.append((f, t_ini, t_fin, resumen, contenido))
     return eventos
 
-# ====== UNIR BLOQUES CONTIGUOS ======
-from datetime import timedelta
-
+# ====== UNIR BLOQUES CONTIGUOS (con gap configurable) ======
 def _norm(s: str) -> str:
     s = (s or "").strip().lower()
     s = re.sub(r"\s+", " ", s)
     return s
 
-def merge_contiguous_events(eventos):
+def merge_contiguous_events(eventos, max_gap_minutes: int = 5):
     """
-    Une eventos contiguos/solapados del MISMO día con IGUAL resumen y descripcion.
-    Entrada y salida: lista de tuplas (fecha, t_ini, t_fin, resumen, descripcion).
-    Reglas:
-      - compara (resumen, descripcion) normalizados
-      - si mismo día y (t_fin_prev == t_ini_curr) o solapan -> extiende t_fin
+    Une eventos del MISMO día con IGUAL resumen y descripcion cuando:
+      - se solapan, o
+      - hay un gap <= max_gap_minutes entre fin actual e inicio siguiente.
     """
     if not eventos:
         return []
 
-    # Orden estable por llave de agrupación y hora de inicio
+    gap = timedelta(minutes=max_gap_minutes)
+
     def sort_key(ev):
         f, ti, tf, res, des = ev
         return (f, _norm(res), _norm(des), ti, tf)
@@ -226,33 +202,27 @@ def merge_contiguous_events(eventos):
     eventos_ord = sorted(eventos, key=sort_key)
     merged = []
 
-    def as_dt(fecha, t):  # helper para comparar tiempos y hacer max
-        return datetime.combine(fecha, t)
-
     cur_f, cur_ti, cur_tf, cur_res, cur_des = eventos_ord[0]
-    for ev in eventos_ord[1:]:
-        f, ti, tf, res, des = ev
+    for f, ti, tf, res, des in eventos_ord[1:]:
         same_day = (f == cur_f)
         same_key = (_norm(res) == _norm(cur_res) and _norm(des) == _norm(cur_des))
 
         if same_day and same_key:
-            # ¿Contiguos o solapados?
-            if as_dt(f, ti) <= as_dt(cur_f, cur_tf):
-                # solapa o toca borde -> extendemos fin
-                if as_dt(f, tf) > as_dt(cur_f, cur_tf):
-                    cur_tf = tf
-                # else: está completamente dentro, ignoramos
-                continue
-            # check contiguo exacto: fin == inicio siguiente
-            if as_dt(cur_f, cur_tf) + timedelta(seconds=0) == as_dt(f, ti):
-                cur_tf = tf
+            cur_end = datetime.combine(cur_f, cur_tf)
+            next_start = datetime.combine(f, ti)
+            next_end = datetime.combine(f, tf)
+
+            # unir si solapa o si el gap es <= max_gap_minutes
+            if next_start <= cur_end + gap:
+                # extender fin al máximo
+                if next_end.time() > cur_tf:
+                    cur_tf = next_end.time()
                 continue
 
-        # si no se unió, cerramos el acumulado
+        # cerrar acumulado
         merged.append((cur_f, cur_ti, cur_tf, cur_res, cur_des))
         cur_f, cur_ti, cur_tf, cur_res, cur_des = f, ti, tf, res, des
 
-    # push último
     merged.append((cur_f, cur_ti, cur_tf, cur_res, cur_des))
     return merged
 
@@ -266,19 +236,12 @@ def slugify(s: str) -> str:
     return s[:40] or "sin-titulo"
 
 def stable_ical_uid(f, t_ini, t_fin, resumen, descripcion) -> str:
-    """
-    UID estable por (fecha, hora inicio/fin, resumen, descripcion).
-    Incluye hash corto para evitar colisiones y problemas de caracteres.
-    """
     base = f"{f.isoformat()}|{t_ini.strftime('%H:%M')}|{t_fin.strftime('%H:%M')}|{resumen}|{descripcion}"
     h = hashlib.sha1(base.encode("utf-8")).hexdigest()[:10]
     return f"inacap-{f.strftime('%Y%m%d')}-{t_ini.strftime('%H%M')}-{t_fin.strftime('%H%M')}-{slugify(resumen)}-{h}@siga"
 
 # ====== GENERACIÓN ICS (con VTIMEZONE) ======
 def construir_evento(uid, resumen, fecha, t_ini, t_fin, descripcion=""):
-    """
-    Crea un VEVENT usando TZID=America/Santiago con UID estable.
-    """
     resumen = (resumen or "").replace("\n", " ").strip()
     desc = (descripcion or "").replace("\n", "\\n")
     dtstamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
@@ -296,10 +259,6 @@ def construir_evento(uid, resumen, fecha, t_ini, t_fin, descripcion=""):
     )
 
 def exportar_ics(eventos, salida="inacap_horario.ics", nombre="Horario INACAP"):
-    """
-    Exporta el calendario incluyendo un bloque VTIMEZONE para America/Santiago.
-    Usa CRLF (\r\n) para máxima compatibilidad con Google Calendar.
-    """
     vtimezone = (
         "BEGIN:VTIMEZONE\r\n"
         f"TZID:{TZID}\r\n"
@@ -370,13 +329,6 @@ def get_calendar_service():
     return build("calendar", "v3", credentials=creds)
 
 def push_to_google_calendar(calendar_id: str, eventos):
-    """
-    Upsert idempotente:
-    - Busca por iCalUID (estable) en el calendario
-    - Si existe: PATCH (update)
-    - Si no: IMPORT (crea nuevo)
-    Además guarda una extendedProperty privada como “ancla” adicional.
-    """
     service = get_calendar_service()
     tzinfo = pytz.timezone(TZID)
 
@@ -387,26 +339,19 @@ def push_to_google_calendar(calendar_id: str, eventos):
         private_key = f"inacap|{f.isoformat()}|{t_ini.strftime('%H:%M')}|{t_fin.strftime('%H:%M')}|{resumen}"
 
         body = {
-            "iCalUID": ical_uid,  # mantiene el hilo “ical”
+            "iCalUID": ical_uid,
             "summary": resumen,
             "description": descripcion,
             "start": {"dateTime": start_dt.isoformat(), "timeZone": TZID},
             "end":   {"dateTime": end_dt.isoformat(),   "timeZone": TZID},
-            "extendedProperties": {
-                "private": {"inacap_key": private_key}
-            },
+            "extendedProperties": {"private": {"inacap_key": private_key}},
         }
 
-        # 1) Buscar por iCalUID (idempotencia primaria)
         existing = service.events().list(
-            calendarId=calendar_id,
-            iCalUID=ical_uid,
-            maxResults=1,
-            singleEvents=True
+            calendarId=calendar_id, iCalUID=ical_uid, maxResults=1, singleEvents=True
         ).execute().get("items", [])
 
         if not existing:
-            # 2) Fallback: buscar por extendedProperties privada
             existing = service.events().list(
                 calendarId=calendar_id,
                 privateExtendedProperty=f"inacap_key={private_key}",
@@ -430,7 +375,6 @@ def login_adfs_y_ir_a_resumen(driver, user, pwd):
     clave_input = wait.until(EC.presence_of_element_located(SEL_ADFS_PASS))
     usuario_input.clear(); usuario_input.send_keys(user)
     clave_input.clear(); clave_input.send_keys(pwd); clave_input.send_keys(Keys.RETURN)
-    # Al volver a intranet, saltamos al resumen SIGA
     wait.until(EC.url_contains("intranet.inacap.cl/tportalvp/alumnos-intranet"))
     driver.get(URL_SIGA_RESUMEN)
     wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
@@ -438,7 +382,6 @@ def login_adfs_y_ir_a_resumen(driver, user, pwd):
 def abrir_bloque_horario(driver):
     wait = WebDriverWait(driver, 25)
     driver.get(URL_SIGA_HORARIO)
-    # Esperar sección y (al menos) el label del rango
     wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, SEL_SECCION)))
     try:
         seccion = driver.find_element(By.CSS_SELECTOR, SEL_SECCION)
@@ -476,18 +419,15 @@ def main():
     ap.add_argument("--dump", action="store_true", help="Guardar dump horario_dump.html para depurar.")
     ap.add_argument("--push", action="store_true", help="Enviar/actualizar eventos a Google Calendar.")
     ap.add_argument("--calendar_id", type=str, default="primary", help="ID de calendario destino (p. ej. 'primary').")
+    ap.add_argument("--merge-gap-min", type=int, default=5, help="Minutos máximos de separación para unir bloques contiguos.")
     args = ap.parse_args()
 
-    # 1) Primero intenta leer de variables de entorno (ideal para GitHub Actions)
     user = os.getenv("SIGA_USER")
     pwd = os.getenv("SIGA_PASS")
-
-    # 2) Si estás local y no definiste variables, pídelo por consola para no hardcodear
     if not user:
         user = input("Usuario SIGA (correo): ").strip()
     if not pwd:
         pwd = getpass("Contraseña SIGA: ").strip()
-
     if not user or not pwd:
         print("Faltan credenciales. Define SIGA_USER y SIGA_PASS o introdúcelas por consola.")
         sys.exit(1)
@@ -495,11 +435,9 @@ def main():
     driver = build_driver(headless=args.headless)
 
     try:
-        # 1) Login + abrir bloque horario
         login_adfs_y_ir_a_resumen(driver, user, pwd)
         abrir_bloque_horario(driver)
 
-        # Forzar semana actual con "Hoy" (si está el botón)
         try:
             btn_hoy = driver.find_element(By.XPATH, "//section[@id='horario-seccion']//button[normalize-space()='Hoy']")
             btn_hoy.click()
@@ -507,7 +445,6 @@ def main():
         except Exception:
             pass
 
-        # 2) Capturar semanas
         acumulados = []
         for i in range(args.weeks):
             html = capturar_semana_html(driver)
@@ -530,23 +467,22 @@ def main():
             if i < args.weeks - 1:
                 mover_semana(driver, "next")
 
-        # 3) Deduplicar por (fecha, ini, fin, resumen, descripcion)
+        # Deduplicar por (fecha, ini, fin, resumen, descripcion)
         key = lambda ev: (ev[0].isoformat(), ev[1].strftime("%H:%M"), ev[2].strftime("%H:%M"), ev[3], ev[4])
         uniq = list({key(ev): ev for ev in acumulados}.values())
 
-        # 4) Unir bloques contiguos/solapados de misma clase en el mismo día
-        merged = merge_contiguous_events(uniq)
+        # Unir bloques con gap permitido
+        merged = merge_contiguous_events(uniq, max_gap_minutes=args.merge_gap_min)
 
-        # 5) Exportar ICS
+        # Exportar ICS
         out_path = args.out
         if os.getenv("GITHUB_ACTIONS", "").lower() == "true":
             os.makedirs("public", exist_ok=True)
             if out_path == "inacap_horario.ics":
                 out_path = "public/inacap_horario.ics"
-
         exportar_ics(merged, salida=out_path)
 
-        # 6) (Opcional) Empujar a Google Calendar (upsert)
+        # Push (upsert)
         if args.push:
             push_to_google_calendar(calendar_id=args.calendar_id, eventos=merged)
             print(f"Sincronización con Google Calendar completada en '{args.calendar_id}'.")
